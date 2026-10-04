@@ -570,10 +570,58 @@ def generate_runtime(ctx: dict[str, Path], profiles_data: dict[str, Any]) -> dic
     return config
 
 
+def detect_running_mihomo_socket() -> Path | None:
+    """Locate the live `-ext-ctl-unix` socket of a running verge-mihomo process.
+
+    Clash Verge Rev in service mode launches the core through
+    `clash-verge-service` with `-ext-ctl-unix` pointing at a socket under
+    `/run/clash-verge-service/...`, which overrides whatever stale
+    `external-controller-unix` value is baked into the generated config. Scanning
+    the running process is the only reliable way to find the real socket.
+    """
+    proc_dir = Path("/proc")
+    if not proc_dir.exists():
+        return None
+
+    for entry in proc_dir.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except (OSError, PermissionError):
+            continue
+        args = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+        if not args or "verge-mihomo" not in args[0]:
+            continue
+        for index, arg in enumerate(args):
+            if arg == "-ext-ctl-unix" and index + 1 < len(args):
+                socket_path = Path(args[index + 1])
+                if socket_path.is_absolute():
+                    return socket_path
+    return None
+
+
+def service_mode_socket() -> Path | None:
+    """Return the privileged service-mode socket for the current user, if present."""
+    uid = os.getuid()
+    candidate = Path(f"/run/clash-verge-service/users/{uid}/verge-mihomo.sock")
+    return candidate if candidate.exists() else None
+
+
 def detect_socket_path(app_home: Path) -> Path:
     env_socket = os.environ.get("CLASH_VERGE_SOCKET")
     if env_socket:
         return Path(env_socket)
+
+    # Service mode (privileged clash-verge-service) is authoritative over the
+    # stale value written into the generated config, so check it first.
+    running_socket = detect_running_mihomo_socket()
+    if running_socket and running_socket.exists():
+        return running_socket
+
+    service_socket = service_mode_socket()
+    if service_socket:
+        return service_socket
 
     for candidate in (app_home / "config.yaml", app_home / "clash-verge.yaml"):
         if not candidate.exists():
